@@ -5,4 +5,5 @@ opencv-python-headless
 ultralytics
 torch
 torchvision
-python-multipart
+transformers
+pillow
