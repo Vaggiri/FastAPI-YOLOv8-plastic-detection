@@ -9,55 +9,66 @@ from PIL import Image
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 from ultralytics import YOLO
-from transformers import CLIPProcessor, CLIPModel
+from torchvision import models, transforms
 
 # ================= CONFIG =================
 CONF_THRESH = 0.3
-CLIP_THRESHOLD = 0.6   # plastic confidence
 MODEL_PATH = "yolov8n.pt"
+MIN_AREA = 500        # for small plastic objects
+TEXTURE_THRESH = 0.25
 # =========================================
 
-# Thread pool
 executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
-# Load YOLO
+# -------- YOLO --------
 yolo = YOLO(MODEL_PATH)
 
-# Load CLIP (pretrained)
-clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
-clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
-clip_model.eval()
+# -------- MobileNet (pretrained, tiny) --------
+mobilenet = models.mobilenet_v3_small(pretrained=True)
+mobilenet.eval()
 
-# Prompts
-TEXT_PROMPTS = ["a plastic object", "a non plastic object"]
+feature_extractor = torch.nn.Sequential(
+    mobilenet.features,
+    mobilenet.avgpool
+)
 
-latest_result = {"plastic": 0, "confidence": 0.0, "timestamp": None}
+transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+])
+
+latest_result = {"plastic": 0, "timestamp": None}
 raw_frame = None
 current_future = None
 
 app = FastAPI()
 
 
-# ============ CLIP PLASTIC CLASSIFIER ============
-def is_plastic_clip(crop):
-    image = Image.fromarray(crop)
+# ============ PLASTIC HEURISTIC ============
+def is_plastic_crop(crop):
+    """
+    Material estimation using texture + reflectance
+    """
+    # 1️⃣ Texture (plastic = low texture)
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    lap_var = cv2.Laplacian(gray, cv2.CV_64F).var()
 
-    inputs = clip_processor(
-        text=TEXT_PROMPTS,
-        images=image,
-        return_tensors="pt",
-        padding=True
-    )
+    # 2️⃣ CNN feature magnitude
+    img = Image.fromarray(crop)
+    x = transform(img).unsqueeze(0)
 
     with torch.no_grad():
-        outputs = clip_model(**inputs)
-        probs = outputs.logits_per_image.softmax(dim=1)[0]
+        feat = feature_extractor(x)
+        feat_score = feat.abs().mean().item()
 
-    plastic_prob = probs[0].item()
-    return plastic_prob, plastic_prob > CLIP_THRESHOLD
+    # Plastic characteristics
+    if lap_var < 120 and feat_score > TEXTURE_THRESH:
+        return True
+
+    return False
 
 
-# ============ YOLO + CLIP PIPELINE ============
+# ============ YOLO PIPELINE ============
 def analyze_frame(jpg_bytes):
     global latest_result
 
@@ -70,29 +81,28 @@ def analyze_frame(jpg_bytes):
     results = yolo(img, conf=CONF_THRESH, verbose=False)[0]
 
     plastic_found = 0
-    confidence = 0.0
 
     for box in results.boxes:
         x1, y1, x2, y2 = map(int, box.xyxy[0])
-        crop = img[y1:y2, x1:x2]
+        area = (x2 - x1) * (y2 - y1)
 
+        if area < MIN_AREA:
+            continue
+
+        crop = img[y1:y2, x1:x2]
         if crop.size == 0:
             continue
 
-        prob, is_plastic = is_plastic_clip(crop)
-
-        if is_plastic:
+        if is_plastic_crop(crop):
             plastic_found = 1
-            confidence = prob
             break
 
     latest_result = {
         "plastic": plastic_found,
-        "confidence": round(confidence, 3),
         "timestamp": datetime.utcnow().isoformat()
     }
 
-    print("Plastic:", plastic_found, "Confidence:", confidence)
+    print("Plastic:", plastic_found)
 
 
 # ================= API =================
